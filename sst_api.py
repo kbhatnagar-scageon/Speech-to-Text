@@ -1,216 +1,262 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 import uvicorn
 import os
 import uuid
 import tempfile
-import shutil
-from typing import Optional, Dict, Any
+from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
-import time
-import asyncio
 from datetime import datetime
-import json
 
-# Import the WhisperTranscriber class from our previous file
-# Make sure this file is in the same directory as your API file
+# Import the optimized WhisperTranscriber class
 from whisper_transcriber import WhisperTranscriber
 
 # Create FastAPI app
 app = FastAPI(
-    title="Audio Transcription API",
-    description="API for transcribing audio files using Whisper",
-    version="1.0.0",
+    title="Speech Transcription API",
+    description="API for transcr ibing speech in audio files using Whisper with Mac M4 Pro optimization",
+    version="1.1.0",
 )
-
-# Create a global transcriber instance
-# We'll use medium as default but allow overriding via API
-transcriber = WhisperTranscriber(model_size="medium", language="en")
-
-# Store jobs in memory (in a production environment, you'd use a database)
-transcription_jobs = {}
 
 # Create temporary directory for uploaded files
 UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "transcription_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-# Models for request/response
+# Model for response
 class TranscriptionResponse(BaseModel):
     job_id: str
     status: str
     created_at: str
+    text_output: str
+    segments: list
+    processing_time_ms: int
+    device_used: str
+    language: str  # Added field to show which language was used
+    language_name: str  # Added field to show language name
 
 
-class TranscriptionResult(BaseModel):
-    job_id: str
-    status: str
-    created_at: str
-    completed_at: Optional[str] = None
-    transcript: Optional[str] = None
-    segments: Optional[list] = None
-    metadata: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
+# Model for language info
+class LanguageInfo(BaseModel):
+    code: str
+    name: str
 
 
-# Helper function to load a different model if requested
-async def load_model_if_needed(model_size: str, language: str):
+# Model for available languages response
+class LanguagesResponse(BaseModel):
+    available_languages: List[LanguageInfo]
+    current_language: str
+    current_language_name: str
+
+
+# Initialize the transcriber as a global variable at startup
+transcriber = None
+
+
+@app.on_event("startup")
+async def startup_event():
     global transcriber
-
-    # Only reload if different from current configuration
-    if model_size != transcriber.model_size or language != transcriber.language:
-        print(f"Loading new model: {model_size} for language: {language}")
-        transcriber = WhisperTranscriber(model_size=model_size, language=language)
-        await asyncio.sleep(0.1)  # Give a moment for the model to load
-
-
-# Background task to process transcription
-async def process_transcription(
-    job_id: str, file_path: str, model_size: str, language: str
-):
-    try:
-        # Update job status
-        transcription_jobs[job_id]["status"] = "processing"
-
-        # Ensure we have the right model loaded
-        await load_model_if_needed(model_size, language)
-
-        # Create a unique output path for the JSON
-        output_path = os.path.join(UPLOAD_DIR, f"{job_id}_transcript.json")
-
-        # Perform the transcription
-        result = transcriber.transcribe_file(file_path, output_path)
-
-        # Update job with results
-        transcription_jobs[job_id].update(
-            {
-                "status": "completed",
-                "completed_at": str(datetime.now()),
-                "transcript": result.get("transcript", ""),
-                "segments": result.get("segments", []),
-                "metadata": result.get("metadata", {}),
-            }
-        )
-
-        # Clean up the temporary file
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-    except Exception as e:
-        # Update job with error
-        transcription_jobs[job_id].update(
-            {"status": "failed", "completed_at": str(datetime.now()), "error": str(e)}
-        )
-
-        # Clean up on error
-        if os.path.exists(file_path):
-            os.remove(file_path)
+    print("Loading Whisper model (large) with Apple Silicon acceleration...")
+    # The optimized transcriber will automatically detect and use MPS on Mac M4
+    transcriber = WhisperTranscriber(model_size="large", language="hi")
+    print(f"Whisper model loaded successfully on device: {transcriber.device}")
 
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    model_size: str = Query(
-        "medium", enum=["tiny", "base", "small", "medium", "large"]
+    language: Optional[str] = Query(
+        None, description="Language code (e.g., 'en' for English, 'hi' for Hindi)"
     ),
-    language: str = Query("en"),
 ):
     """
-    Upload an audio file to transcribe. Returns a job ID that can be used to fetch results.
+    Upload a speech audio file and get transcription JSON.
 
-    - **file**: Audio file to transcribe (supports various formats)
-    - **model_size**: Size of the Whisper model to use
-    - **language**: Language code (e.g., "en" for English)
+    - **file**: Audio file containing speech (supports various formats)
+    - **language**: Optional language code to use for this transcription (e.g., 'en', 'hi')
     """
+    start_time = datetime.now()
+
     # Generate a unique job ID
     job_id = str(uuid.uuid4())
 
-    # Save the uploaded file
-    file_extension = os.path.splitext(file.filename)[1] if file.filename else ".tmp"
-    temp_file_path = os.path.join(UPLOAD_DIR, f"{job_id}{file_extension}")
+    # Get original filename and extension
+    original_filename = file.filename or "unknown_file"
+    file_extension = (
+        os.path.splitext(original_filename)[1] if original_filename else ".tmp"
+    )
+
+    # Create a safe filename with the job_id and original extension
+    safe_filename = f"{job_id}{file_extension}"
+
+    # Path for temporary processing
+    temp_file_path = os.path.join(UPLOAD_DIR, safe_filename)
 
     try:
+        # Save the uploaded file temporarily for processing
+        file_contents = await file.read()
         with open(temp_file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            buffer.write(file_contents)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
-    finally:
-        file.file.close()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save temporary file: {str(e)}"
+        )
 
-    # Create job record
-    job_info = {
-        "job_id": job_id,
-        "status": "queued",
-        "created_at": str(datetime.now()),
-        "file_path": temp_file_path,
-        "model_size": model_size,
-        "language": language,
-    }
-    transcription_jobs[job_id] = job_info
+    try:
+        # Create output path for JSON
+        output_json_path = os.path.join(UPLOAD_DIR, f"{job_id}_transcript.json")
 
-    # Start background processing
-    background_tasks.add_task(
-        process_transcription, job_id, temp_file_path, model_size, language
+        # Get the language to use (either from query parameter or current default)
+        transcription_language = language or transcriber.language
+
+        # Perform transcription using the pre-loaded model
+        result = transcriber.transcribe_file(
+            temp_file_path, output_json_path, language=transcription_language
+        )
+
+        # Get transcript text
+        transcript_text = result.get("transcript", "")
+
+        # Process segments to include timing info but avoid duplicating full text
+        segments = []
+        for segment in result.get("segments", []):
+            # Only keep timing information and segment ID if present
+            processed_segment = {
+                "start_time": segment.get("start_time", 0),
+                "end_time": segment.get("end_time", 0),
+                "timestamp": segment.get("timestamp", datetime.now().isoformat()),
+            }
+            # If there are individual segment texts that are different from the full transcript, keep those
+            if "text" in segment and segment["text"] != transcript_text:
+                processed_segment["text"] = segment["text"]
+
+            segments.append(processed_segment)
+
+        # Calculate processing time
+        end_time = datetime.now()
+        processing_time_ms = int((end_time - start_time).total_seconds() * 1000)
+
+        # Get metadata
+        metadata = result.get("metadata", {})
+        device_used = metadata.get("device", "unknown")
+        used_language = metadata.get("language", transcription_language)
+        language_name = metadata.get(
+            "language_name",
+            transcriber.language_names.get(used_language, used_language),
+        )
+
+        # Create response
+        response = TranscriptionResponse(
+            job_id=job_id,
+            status="completed",
+            created_at=datetime.now().isoformat(),
+            text_output=transcript_text,
+            segments=segments,
+            processing_time_ms=processing_time_ms,
+            device_used=device_used,
+            language=used_language,
+            language_name=language_name,
+        )
+
+        # Clean up temporary files
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        if os.path.exists(output_json_path):
+            os.remove(output_json_path)
+
+        return response
+
+    except Exception as e:
+        # Clean up on error
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+
+@app.get("/languages", response_model=LanguagesResponse)
+async def get_available_languages():
+    """Get a list of available languages for transcription"""
+    if not transcriber:
+        raise HTTPException(
+            status_code=503, detail="Transcription service not initialized"
+        )
+
+    languages = transcriber.get_available_languages()
+    language_list = [
+        LanguageInfo(code=code, name=name) for code, name in languages.items()
+    ]
+
+    # Get current language
+    current_lang = transcriber.language
+    current_lang_name = transcriber.language_names.get(current_lang, current_lang)
+
+    return LanguagesResponse(
+        available_languages=language_list,
+        current_language=current_lang,
+        current_language_name=current_lang_name,
     )
 
-    # Return job ID immediately
-    return TranscriptionResponse(
-        job_id=job_id, status="queued", created_at=job_info["created_at"]
-    )
 
+@app.post("/set_language/{language_code}", response_model=Dict[str, str])
+async def set_language(language_code: str):
+    """Set the default language for transcription"""
+    if not transcriber:
+        raise HTTPException(
+            status_code=503, detail="Transcription service not initialized"
+        )
 
-@app.get("/jobs/{job_id}", response_model=TranscriptionResult)
-async def get_job_status(job_id: str):
-    """
-    Get the status or result of a transcription job
-    """
-    if job_id not in transcription_jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
+    # Get available languages
+    available_languages = transcriber.get_available_languages()
 
-    return transcription_jobs[job_id]
+    # Check if the language code is valid
+    if language_code not in available_languages and language_code != "auto":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid language code. Available codes: {', '.join(available_languages.keys())} or 'auto'",
+        )
+
+    # Change the language
+    message = transcriber.change_language(language_code)
+
+    return {"message": message}
 
 
 @app.get("/")
 async def root():
     """Root endpoint to verify the API is running"""
-    return {"status": "online", "service": "Whisper Transcription API"}
+    if not transcriber:
+        return {
+            "status": "initializing",
+            "service": "Speech Transcription API with Mac M4 Pro optimization",
+        }
 
-
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for monitoring"""
     return {
-        "status": "healthy",
-        "model": transcriber.model_size,
-        "language": transcriber.language,
+        "status": "online",
+        "service": "Speech Transcription API with Mac M4 Pro optimization",
         "device": transcriber.device,
+        "current_language": transcriber.language,
+        "current_language_name": transcriber.language_names.get(
+            transcriber.language, transcriber.language
+        ),
+        "endpoints": [
+            {
+                "path": "/transcribe",
+                "method": "POST",
+                "description": "Upload and transcribe an audio file",
+            },
+            {
+                "path": "/languages",
+                "method": "GET",
+                "description": "Get available languages for transcription",
+            },
+            {
+                "path": "/set_language/{language_code}",
+                "method": "POST",
+                "description": "Set the default language for transcription",
+            },
+        ],
+        "model": f"Whisper large (loaded on {transcriber.device})",
     }
 
 
-# Optional: endpoint to clean up old jobs (in a real app, you'd use a scheduled task)
-@app.delete("/cleanup")
-async def cleanup_old_jobs():
-    """Remove completed jobs older than 1 hour"""
-    current_time = time.time()
-    removed_count = 0
-
-    for job_id in list(transcription_jobs.keys()):
-        job = transcription_jobs[job_id]
-        if job["status"] in ["completed", "failed"]:
-            created_time = datetime.fromisoformat(
-                job["created_at"].replace("Z", "+00:00")
-            )
-            age_seconds = (datetime.now() - created_time).total_seconds()
-
-            # If older than 1 hour, remove
-            if age_seconds > 3600:
-                transcription_jobs.pop(job_id)
-                removed_count += 1
-
-    return {"message": f"Removed {removed_count} old jobs"}
-
-
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("sst_api:app", host="0.0.0.0", port=8000, reload=False)
